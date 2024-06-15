@@ -1,6 +1,7 @@
 module PureScript.Backend.Optimizer.Tracer.Printer
   ( printModuleSteps
   , printSteps
+  , printModuleStepPairs
   ) where
 
 import Prelude
@@ -29,6 +30,9 @@ heading repeat hd =
     , D.withPosition \{ column, pageWidth } ->
         D.text (power repeat (pageWidth - column))
     ]
+
+printModuleStepPairs :: Tuple ModuleName OptimizationSteps -> Doc Void
+printModuleStepPairs = uncurry printModuleSteps
 
 printModuleSteps :: ModuleName -> OptimizationSteps -> Doc Void
 printModuleSteps (ModuleName mod) steps =

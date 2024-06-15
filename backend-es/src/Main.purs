@@ -46,13 +46,17 @@ import Node.Path (FilePath)
 import Node.Path as Path
 import Node.Process as Process
 import Node.Stream as Stream
+import PureScript.Backend.Optimizer.Analysis (BackendAnalysis)
+import PureScript.Backend.Optimizer.Builder (BuildEnv)
 import PureScript.Backend.Optimizer.Codegen.EcmaScript (codegenModule, esModulePath)
 import PureScript.Backend.Optimizer.Codegen.EcmaScript.Builder (basicBuildMain, externalDirectivesFromFile)
 import PureScript.Backend.Optimizer.Codegen.EcmaScript.Foreign (esForeignSemantics)
-import PureScript.Backend.Optimizer.Convert (OptimizationSteps)
-import PureScript.Backend.Optimizer.CoreFn (Ident(..), Module(..), ModuleName(..), Qualified(..))
-import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics)
-import PureScript.Backend.Optimizer.Tracer.Printer (printModuleSteps)
+import PureScript.Backend.Optimizer.Convert (BackendModule, OptimizationSteps)
+import PureScript.Backend.Optimizer.CoreFn (Ann, Ident(..), Module(..), ModuleName(..), Qualified(..))
+import PureScript.Backend.Optimizer.Semantics (BackendExpr, Ctx, InlineDirectiveMap)
+import PureScript.Backend.Optimizer.Semantics.Foreign (ForeignEval, coreForeignSemantics)
+import PureScript.Backend.Optimizer.Syntax (BackendSyntax)
+import PureScript.Backend.Optimizer.Tracer.Printer (printModuleStepPairs)
 import PureScript.CST.Lexer (lexToken)
 import PureScript.CST.Lexer as Lexer
 import PureScript.CST.Types (Token(..))
@@ -226,123 +230,182 @@ main cliRoot =
     Left err ->
       Console.error $ ArgParser.printArgError err
     Right (Build args) -> launchAff_ do
-      buildCmd args
+      buildCmd cliRoot args
     Right (BundleModule bundleArgs args) -> launchAff_ do
-      unless bundleArgs.noBuild $ buildCmd args
+      unless bundleArgs.noBuild $ buildCmd cliRoot args
       bundleCmd false bundleArgs args
     Right (BundleApp bundleArgs args) -> launchAff_ do
-      unless bundleArgs.noBuild $ buildCmd args
+      unless bundleArgs.noBuild $ buildCmd cliRoot args
       bundleCmd true bundleArgs args
-  where
-  makeBuildState :: Effect BuildState
-  makeBuildState = do
-    startTime <- now
-    currentStartTime <- Ref.new Nothing
-    codegenStartTime <- Ref.new Nothing
-    codegenTotal <- Ref.new mempty
-    steps <- Ref.new []
-    timings <- Ref.new Map.empty
-    pure { currentStartTime, codegenStartTime, codegenTotal, startTime, steps, timings }
 
-  buildCmd :: BuildArgs -> Aff Unit
-  buildCmd args = liftEffect makeBuildState >>= \state -> basicBuildMain
-    { resolveCoreFnDirectory: pure args.coreFnDir
-    , resolveExternalDirectives: map (fromMaybe Map.empty) $ traverse externalDirectivesFromFile args.directivesFile
-    , analyzeCustom: \_ _ -> Nothing
-    , foreignSemantics: Map.union coreForeignSemantics esForeignSemantics
-    , onCodegenBefore: do
-        liftEffect $ flip Ref.write state.codegenStartTime <<< Just =<< now
-        mkdirp args.outputDir
-        writeTextFile UTF8 (Path.concat [ args.outputDir, "package.json" ]) esModulePackageJson
-        copyFile (Path.concat [ cliRoot, "runtime.js" ]) (Path.concat [ args.outputDir, "runtime.js" ])
-    , onCodegenAfter: do
-        allSteps <- liftEffect (Ref.read state.steps)
-        when args.printTiming do
-          endTime <- liftEffect now
-          codegenStartTime <- fromMaybe state.startTime <$> liftEffect (Ref.read state.codegenStartTime)
-          codegenTiming <- liftEffect $ Ref.read state.codegenTotal
-          timings <- Array.sortBy (comparing (Down <<< snd)) <<< Map.toUnfoldable <$> liftEffect (Ref.read state.timings)
-          let topTimings = Array.take 20 timings
-          let totalTiming = timeDiff state.startTime endTime
-          let parseTiming = timeDiff state.startTime codegenStartTime
-          let buildTiming = over2 Milliseconds (-) (timeDiff codegenStartTime endTime) codegenTiming
-          Console.log $ "\nTop " <> show (Array.length topTimings) <> " slowest modules:"
-          Console.log $ printTimings topTimings
-          Console.log ""
-          Console.log $ printTotals
-            [ Tuple "Parse time" parseTiming
-            , Tuple "Build time" buildTiming
-            , Tuple "Codegen time" codegenTiming
-            , Tuple "Total time" totalTiming
-            ]
-        unless (Array.null allSteps) do
-          let allDoc = Dodo.foldWithSeparator (Dodo.break <> Dodo.break) $ uncurry printModuleSteps <$> allSteps
-          FS.writeTextFile UTF8 "optimization-traces.txt" $ Dodo.print Dodo.plainText Dodo.twoSpaces allDoc
-    , onCodegenModule: \build (Module coreFnMod) backendMod@{ name: ModuleName name } optimizationSteps -> do
-        optEndTime <- liftEffect now
-        let formatted = Dodo.print Dodo.plainText (Dodo.twoSpaces { pageWidth = 180, ribbonRatio = 1.0 }) $ codegenModule { intTags: args.intTags } build.implementations backendMod
-        let modPath = Path.concat [ args.outputDir, name ]
-        mkdirp modPath
-        writeTextFile UTF8 (Path.concat [ modPath, "index.js" ]) formatted
-        unless (Set.isEmpty backendMod.foreign) do
-          let foreignOutputPath = Path.concat [ modPath, "foreign.js" ]
-          origPath <- liftEffect $ Path.resolve [ args.outputDir, ".." ] coreFnMod.path
-          let foreignSiblingPath = fromMaybe origPath (String.stripSuffix (Pattern (Path.extname origPath)) origPath) <> ".js"
-          res <- attempt $ oneOf
-            [ maybe empty (\dir -> copyFile (Path.concat [ dir, esModulePath backendMod.name ]) foreignOutputPath) args.foreignDir
-            , copyFile foreignSiblingPath foreignOutputPath
-            ]
-          unless (isRight res) do
-            Console.log $ "  Foreign implementation missing."
-        unless (Array.null optimizationSteps) do
-          liftEffect $ Ref.modify_ (flip Array.snoc (Tuple backendMod.name optimizationSteps)) state.steps
-        mbStartTime <- liftEffect $ Ref.read state.currentStartTime
-        for_ mbStartTime \startTime -> do
-          moduleEndTime <- liftEffect now
-          let codegenTotal = timeDiff optEndTime moduleEndTime
-          let timingTotal = timeDiff startTime moduleEndTime
-          liftEffect $ Ref.modify_ (codegenTotal <> _) state.codegenTotal
-          liftEffect $ Ref.modify_ (Map.insert backendMod.name timingTotal) state.timings
-          writeString Process.stdout $ formatMs timingTotal <> "\n"
+makeBuildState :: Effect BuildState
+makeBuildState = do
+  startTime <- now
+  currentStartTime <- Ref.new Nothing
+  codegenStartTime <- Ref.new Nothing
+  codegenTotal <- Ref.new mempty
+  steps <- Ref.new []
+  timings <- Ref.new Map.empty
+  pure { currentStartTime, codegenStartTime, codegenTotal, startTime, steps, timings }
 
-    , onPrepareModule: \build coreFnMod@(Module { name }) -> do
-        let total = show build.moduleCount
-        let index = show (build.moduleIndex + 1)
-        let padding = power " " (SCU.length total - SCU.length index)
-        let msg = "[" <> padding <> index <> " of " <> total <> "] Building " <> unwrap name
-        if args.printTiming then do
-          liftEffect $ flip Ref.write state.currentStartTime <<< Just =<< now
-          writeString Process.stdout $ msg <> "... "
-        else
-          Console.log msg
-        pure coreFnMod
-    , traceIdents: args.traceIdents
+analyzeCustom :: Ctx -> BackendSyntax BackendExpr -> Maybe BackendAnalysis
+analyzeCustom = \_ _ -> Nothing
+
+foreignSemantics :: Map (Qualified Ident) ForeignEval
+foreignSemantics = Map.union coreForeignSemantics esForeignSemantics
+
+buildCmd :: FilePath -> BuildArgs -> Aff Unit
+buildCmd cliRoot args = do
+  state <- liftEffect makeBuildState
+  let
+    resolveCoreFnDirectory :: Aff FilePath
+    resolveCoreFnDirectory = pure args.coreFnDir
+
+    resolveExternalDirectives :: Aff InlineDirectiveMap
+    resolveExternalDirectives =
+      map (fromMaybe Map.empty) $ traverse externalDirectivesFromFile args.directivesFile
+
+    copyRuntime :: Aff Unit
+    copyRuntime = do
+      let sourcePath = Path.concat [ cliRoot, "runtime.js" ]
+      let destinationPath = Path.concat [ args.outputDir, "runtime.js" ]
+      copyFile sourcePath destinationPath
+
+    writePackageFile :: Aff Unit
+    writePackageFile = do
+      let location = Path.concat [ args.outputDir, "package.json" ]
+      writeTextFile UTF8 location esModulePackageJson
+
+    updateCodegenStartTime :: Aff Unit
+    updateCodegenStartTime = liftEffect do
+      currentTime <- now
+      Ref.write (Just currentTime) state.codegenStartTime
+
+    makeOutPutDirectory :: Aff Unit
+    makeOutPutDirectory = do
+      mkdirp args.outputDir
+
+    onCodegenBefore :: Aff Unit
+    onCodegenBefore = do
+      updateCodegenStartTime
+      makeOutPutDirectory
+      writePackageFile
+      copyRuntime
+
+    onCodegenAfter :: Aff Unit
+    onCodegenAfter = do
+      allSteps <- liftEffect (Ref.read state.steps)
+      when args.printTiming do
+        endTime <- liftEffect now
+        codegenStartTime <- liftEffect do
+          maybeCodegenStartTime <- Ref.read state.codegenStartTime
+          pure $ fromMaybe state.startTime maybeCodegenStartTime
+        codegenTiming <- liftEffect $ Ref.read state.codegenTotal
+        sortedTimings <- liftEffect do
+          timingsMap <- Ref.read state.timings
+          let secondDescending = comparing (Down <<< snd)
+          let timingsList = Map.toUnfoldable timingsMap
+          pure $ Array.sortBy secondDescending timingsList
+        let nth = 20
+        let topTimings = Array.take nth sortedTimings
+        let totalTiming = timeDiff state.startTime endTime
+        let parseTiming = timeDiff state.startTime codegenStartTime
+        let buildTiming = over2 Milliseconds (-) (timeDiff codegenStartTime endTime) codegenTiming
+        Console.log $ "\nTop " <> show nth <> " slowest modules:"
+        Console.log $ printTimings topTimings
+        Console.log ""
+        Console.log $ printTotals
+          [ Tuple "Parse time" parseTiming
+          , Tuple "Build time" buildTiming
+          , Tuple "Codegen time" codegenTiming
+          , Tuple "Total time" totalTiming
+          ]
+      unless (Array.null allSteps) do
+        let breakTwice = Dodo.break <> Dodo.break
+        let stepsAsDocs = printModuleStepPairs <$> allSteps
+        let allDoc = Dodo.foldWithSeparator breakTwice stepsAsDocs
+        let optimizationTraces = Dodo.print Dodo.plainText Dodo.twoSpaces allDoc
+        FS.writeTextFile UTF8 "optimization-traces.txt" optimizationTraces
+
+    onCodegenModule :: BuildEnv -> Module Ann -> BackendModule -> OptimizationSteps -> Aff Unit
+    onCodegenModule = \build (Module coreFnMod) backendMod@{ name: ModuleName name } optimizationSteps -> do
+      optEndTime <- liftEffect now
+      let formatted = Dodo.print Dodo.plainText (Dodo.twoSpaces { pageWidth = 180, ribbonRatio = 1.0 }) $ codegenModule { intTags: args.intTags } build.implementations backendMod
+      let modPath = Path.concat [ args.outputDir, name ]
+      mkdirp modPath
+      writeTextFile UTF8 (Path.concat [ modPath, "index.js" ]) formatted
+      unless (Set.isEmpty backendMod.foreign) do
+        let foreignOutputPath = Path.concat [ modPath, "foreign.js" ]
+        origPath <- liftEffect $ Path.resolve [ args.outputDir, ".." ] coreFnMod.path
+        let foreignSiblingPath = fromMaybe origPath (String.stripSuffix (Pattern (Path.extname origPath)) origPath) <> ".js"
+        res <- attempt $ oneOf
+          [ maybe empty (\dir -> copyFile (Path.concat [ dir, esModulePath backendMod.name ]) foreignOutputPath) args.foreignDir
+          , copyFile foreignSiblingPath foreignOutputPath
+          ]
+        unless (isRight res) do
+          Console.log $ "  Foreign implementation missing."
+      unless (Array.null optimizationSteps) do
+        liftEffect $ Ref.modify_ (flip Array.snoc (Tuple backendMod.name optimizationSteps)) state.steps
+      mbStartTime <- liftEffect $ Ref.read state.currentStartTime
+      for_ mbStartTime \startTime -> do
+        moduleEndTime <- liftEffect now
+        let codegenTotal = timeDiff optEndTime moduleEndTime
+        let timingTotal = timeDiff startTime moduleEndTime
+        liftEffect $ Ref.modify_ (codegenTotal <> _) state.codegenTotal
+        liftEffect $ Ref.modify_ (Map.insert backendMod.name timingTotal) state.timings
+        writeString Process.stdout $ formatMs timingTotal <> "\n"
+
+    onPrepareModule :: BuildEnv -> Module Ann -> Aff (Module Ann)
+    onPrepareModule build coreFnMod@(Module { name }) = do
+      let total = show build.moduleCount
+      let index = show (build.moduleIndex + 1)
+      let padding = power " " (SCU.length total - SCU.length index)
+      let msg = "[" <> padding <> index <> " of " <> total <> "] Building " <> unwrap name
+      if args.printTiming then do
+        liftEffect $ flip Ref.write state.currentStartTime <<< Just =<< now
+        writeString Process.stdout $ msg <> "... "
+      else
+        Console.log msg
+      pure coreFnMod
+
+    traceIdents :: Set (Qualified Ident)
+    traceIdents = args.traceIdents
+  basicBuildMain
+    { resolveCoreFnDirectory
+    , resolveExternalDirectives
+    , analyzeCustom
+    , foreignSemantics
+    , onCodegenBefore
+    , onCodegenAfter
+    , onCodegenModule
+    , onPrepareModule
+    , traceIdents
     }
 
-  bundleCmd :: Boolean -> BundleArgs -> BuildArgs -> Aff Unit
-  bundleCmd shouldInvokeMain bundleArgs args = do
-    entryPath <- liftEffect $ Path.resolve [] $ Path.concat
-      [ args.outputDir
-      , unwrap bundleArgs.entryModule
-      , "index.js"
+bundleCmd :: Boolean -> BundleArgs -> BuildArgs -> Aff Unit
+bundleCmd shouldInvokeMain bundleArgs args = do
+  entryPath <- liftEffect $ Path.resolve [] $ Path.concat
+    [ args.outputDir
+    , unwrap bundleArgs.entryModule
+    , "index.js"
+    ]
+  let
+    esBuildArgs = Array.filter (not <<< String.null)
+      [ case bundleArgs.targetPlatform of
+          Browser -> "--platform=browser"
+          Node -> "--platform=node"
+      , case bundleArgs.targetPlatform of
+          Browser | shouldInvokeMain -> "--format=iife"
+          _ -> "--format=esm"
+      , guard bundleArgs.minify "--minify"
+      , guard bundleArgs.sourceMaps "--sourcemap"
+      , "--outfile=" <> bundleArgs.targetFile
+      , "--bundle"
       ]
-    let
-      esBuildArgs = Array.filter (not <<< String.null)
-        [ case bundleArgs.targetPlatform of
-            Browser -> "--platform=browser"
-            Node -> "--platform=node"
-        , case bundleArgs.targetPlatform of
-            Browser | shouldInvokeMain -> "--format=iife"
-            _ -> "--format=esm"
-        , guard bundleArgs.minify "--minify"
-        , guard bundleArgs.sourceMaps "--sourcemap"
-        , "--outfile=" <> bundleArgs.targetFile
-        , "--bundle"
-        ]
-    if shouldInvokeMain then do
-      spawnFromParentWithStdin "esbuild" esBuildArgs $ Just $ "import { main } from '" <> entryPath <> "'; main();"
-    else
-      spawnFromParentWithStdin "esbuild" (Array.snoc esBuildArgs entryPath) Nothing
+  if shouldInvokeMain then do
+    spawnFromParentWithStdin "esbuild" esBuildArgs $ Just $ "import { main } from '" <> entryPath <> "'; main();"
+  else
+    spawnFromParentWithStdin "esbuild" (Array.snoc esBuildArgs entryPath) Nothing
 
 copyFile :: FilePath -> FilePath -> Aff Unit
 copyFile from to = do
